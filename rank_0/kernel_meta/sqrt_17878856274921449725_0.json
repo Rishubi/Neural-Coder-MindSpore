@@ -1,0 +1,15 @@
+{
+    "batchBindOnly": 1,
+    "binFileName": "sqrt_17878856274921449725_0",
+    "binFileSuffix": ".o",
+    "blockDim": 1,
+    "build_result": "",
+    "kernelName": "sqrt_17878856274921449725_0__kernel0",
+    "magic": "RT_DEV_BINARY_MAGIC_ELF",
+    "opParaSize": 0,
+    "parameters": [
+        0,
+        0
+    ],
+    "sha256": "bbe001112336ba3da8d4128c9e6e0bdf38ae517a2ad15044b0dc658469dcfe31"
+}
