@@ -23,8 +23,8 @@ __ca__   uint8_t* dst_l0a = (__ca__  uint8_t *)get_imm(0);
   for (int32_t i = 0; i < 2; ++i) {
     mad(((__cc__ half *)dst_l0c + (i * 256)), ((__ca__ half *)dst_l0a), ((__cb__ half *)dst_l0b), 256, 128, 256, 1);
   }
-  reg_buf7[0] = (half)-2.660511e+00f;
-  reg_buf8[0] = (int8_t)7;
+  reg_buf7[0] = (half)5.867063e+00f;
+  reg_buf8[0] = (int8_t)6;
   set_vector_mask(0x0, 0xffff);
   for (int32_t j = 0; j < 7; ++j) {
     vadds(((__ubuf__ half *)src_ub + ((j * 16384) + (((int32_t)reg_buf8[0]) * 16))), ((__ubuf__ half *)src_ub + ((j * 16384) + (((int32_t)reg_buf8[0]) * 16))), reg_buf7[0], (int64_t)6917537858093907969);

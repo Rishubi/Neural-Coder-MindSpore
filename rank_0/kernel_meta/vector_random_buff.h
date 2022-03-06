@@ -11,8 +11,8 @@ set_atomic_none();
      int8_t reg_buf6[1] = {0};
   __ubuf__   uint8_t* src_ub = (__ubuf__  uint8_t *)get_imm(0);
   // "aicore arch: Ascend910"
-  reg_buf5[0] = (half)8.134783e+00f;
-  reg_buf6[0] = (int8_t)6;
+  reg_buf5[0] = (half)4.117949e+00f;
+  reg_buf6[0] = (int8_t)2;
   set_vector_mask(0x0, 0xffff);
   for (int32_t i = 0; i < 8; ++i) {
     vadds(((__ubuf__ half *)src_ub + ((i * 16384) + (((int32_t)reg_buf6[0]) * 16))), ((__ubuf__ half *)src_ub + ((i * 16384) + (((int32_t)reg_buf6[0]) * 16))), reg_buf5[0], (int64_t)6917537858093907969);
