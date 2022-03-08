@@ -21,8 +21,8 @@ import mindspore.numpy as np
 import math
 from mindspore import nn
 from mindspore import ops
-from mindspore.ops import operations as P
-
+import mindspore.ops.operations as P
+import mindspore.ops.functional as F
 
 from .configuration_gptj import GPTJConfig
 
@@ -31,11 +31,8 @@ class GPTJAttention(nn.Cell):
     def __init__(self, config):
         super().__init__()
 
-        # max_positions = config.max_position_embeddings
+        self.max_positions = config.max_position_embeddings
         self.masked_bias = mindspore.Parameter(-1e9, requires_grad=False)
-        # self.bias = mindspore.Parameter(self.tril(self.ones((max_positions, max_positions), mindspore.uint8)).view(
-        #         1, 1, max_positions, max_positions
-        #     ), requires_grad = False)
 
         self.attn_dropout = nn.Dropout(1 - config.attn_pdrop)
         self.resid_dropout = nn.Dropout(1 - config.resid_pdrop)
@@ -60,8 +57,14 @@ class GPTJAttention(nn.Cell):
         self.stack = P.Stack(axis=-1)
         self.sin = P.Sin()
         self.cos = P.Cos()
+        self.mul = P.Mul()
+        self.add = P.Add()
+        self.sub = P.Sub()
         self.matmul = P.MatMul()
         self.bmatmul = P.BatchMatMul()
+        self.reshape = P.Reshape()
+        self.split = P.Split(3, 2)
+        self.slice = P.StridedSlice()
 
         self.scale_attn = self.sqrt(mindspore.Tensor(self.head_dim, dtype=mindspore.float32))
 
@@ -71,17 +74,25 @@ class GPTJAttention(nn.Cell):
         self.out_proj = nn.Dense(self.embed_dim, self.embed_dim, has_bias=False)
         self.rotary_dim = config.rotary_dim
 
+        inv_freq = self.div(1.0, self.pow(10000, self.div(np.arange(0, self.rotary_dim, 2).astype(mindspore.float32), self.rotary_dim)))
+        inv_freq = self.expand_dims(inv_freq, 0)
+        seq = np.arange(self.max_positions).astype(mindspore.float32)
+        seq = self.expand_dims(seq, 1)
+        sinusoid_inp = self.matmul(seq, inv_freq)
+        self.sins = self.sin(sinusoid_inp)
+        self.coss = self.cos(sinusoid_inp)
+
     def _split_heads(self, tensor, num_attention_heads, attn_head_size, rotary):
         """
         Splits hidden dim into attn_head_size and num_attention_heads
         """
-        new_shape = tensor.shape[:-1] + (num_attention_heads, attn_head_size)
+        new_shape = F.shape(tensor)[:2] + (num_attention_heads, attn_head_size)
         tensor = tensor.view(*new_shape)
         if rotary:
             return tensor
-        if len(tensor.shape) == 5:
+        if len(F.shape(tensor)) == 5:  # (batch, blocks, block_length, head, head_features)
             return self.transpose(tensor, (0, 1, 3, 2, 4))  # (batch, blocks, head, block_length, head_features)
-        elif len(tensor.shape) == 4:
+        elif len(F.shape(tensor)) == 4:  # (batch, seq_length, head, head_features)
             return self.transpose(tensor, (0, 2, 1, 3))  # (batch, head, seq_length, head_features)
         else:
             return None
@@ -91,38 +102,30 @@ class GPTJAttention(nn.Cell):
         """
         Merges attn_head_size dim and num_attn_heads dim into hidden dim
         """
-        if len(tensor.shape) == 5:
+        if len(F.shape(tensor)) == 5:
             tensor = self.transpose(tensor, (0, 1, 3, 2, 4))
-        elif len(tensor.shape) == 4:
+        elif len(F.shape(tensor)) == 4:
             tensor = self.transpose(tensor, (0, 2, 1, 3))
         else:
             return None
             # raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
-        new_shape = tensor.shape[:-2] + (num_attention_heads * attn_head_size,)
+        new_shape = F.shape(tensor)[:2] + (num_attention_heads * attn_head_size,)
         return tensor.view(new_shape)
 
-    def _fixed_pos_embedding(self, x, seq_dim=1, seq_len=None):
-        dim = x.shape[-1]
-        if seq_len is None:
-            seq_len = x.shape[seq_dim]
-        inv_freq = self.div(1.0, self.pow(10000, self.div(np.arange(0, dim, 2).astype(mindspore.float32), dim)))
-        # inv_freq = 1.0 / (10000 ** (np.arange(0, dim, 2) / dim))
-        inv_freq = np.expand_dims(inv_freq, 0)
-        seq = np.expand_dims(np.arange(seq_len).astype(mindspore.float32), 1)
-        sinusoid_inp = np.matmul(seq, inv_freq)
-        # sinusoid_inp = np.ones((seq.size, inv_freq.size))
-        return self.sin(sinusoid_inp), self.cos(sinusoid_inp)
-
     def _rotate_every_two(self, x):
-        x1 = x[:, :, :, ::2]
-        x2 = x[:, :, :, 1::2]
+        x_shape = F.shape(x)
+        x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
+        x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
+        # x1 = x[:, :, :, ::2]
+        # x2 = x[:, :, :, 1::2]
         x = self.stack((-x2, x1))
-        shape = x.shape[:-2] + (x.shape[-2] * x.shape[-1],)
-        return x.reshape(shape)  # in einsum notation: rearrange(x, '... d j -> ... (d j)')
+        x_shape = F.shape(x)
+        shape = x_shape[:3] + (x_shape[3] * x_shape[4],)
+        return self.reshape(x, shape)  # in einsum notation: rearrange(x, '... d j -> ... (d j)')
 
-    def _apply_rotary_pos_emb(self, x, sincos, offset=0):
-        sin, cos = ops.repeat_elements(sincos[0][None, offset : x.shape[1] + offset, None, :], 2, 3), ops.repeat_elements(sincos[1][None, offset : x.shape[1] + offset, None, :], 2, 3)
-        # einsum notation for lambda t: repeat(t[offset:x.shape[1]+offset,:], "n d -> () n () (d j)", j=2)
+    def _apply_rotary_pos_emb(self, x, sins, coss, offset=0):
+        sin = ops.repeat_elements(self.expand_dims(self.expand_dims(sins, 1), 0), 2, 3)
+        cos = ops.repeat_elements(self.expand_dims(self.expand_dims(coss, 1), 0), 2, 3)
         return (x * cos) + (self._rotate_every_two(x) * sin)
 
     def _attn(
@@ -136,14 +139,18 @@ class GPTJAttention(nn.Cell):
     ):
 
         # compute causal mask from causal mask buffer
-        # query_length, key_length = query.size(-2), key.size(-2)
-        # causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
 
         # Keep the attention weights computation in fp32 to avoid overflow issues
         query = self.cast(query, mindspore.float32)
         key = self.cast(key, mindspore.float32)
         attn_weights = self.bmatmul(query, key.transpose((0, 1, 3, 2)))
-        attn_weights = mindspore.numpy.where(causal_mask, attn_weights, self.cast(self.masked_bias, attn_weights.dtype))
+        inverse_mask = self.sub(
+            self.cast(F.tuple_to_array((1.0,)), attn_weights.dtype),
+            self.cast(causal_mask, attn_weights.dtype)
+        )
+        adder = self.mul(inverse_mask, attn_weights)
+        attn_weights = self.mul(causal_mask, attn_weights)
+        attn_weights = self.add(attn_weights, adder)
 
         attn_weights = attn_weights / self.scale_attn
 
@@ -156,6 +163,7 @@ class GPTJAttention(nn.Cell):
         attn_weights = self.attn_dropout(attn_weights)
 
         # Mask heads if we want to
+
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
@@ -172,38 +180,41 @@ class GPTJAttention(nn.Cell):
         head_mask=None,
     ):
 
-        query = self.q_proj(hidden_states)
+        query = self.q_proj(hidden_states)  # (batch, seq_length, hidden_dim)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        query = self._split_heads(query, self.num_attention_heads, self.head_dim, True)
+        query = self._split_heads(query, self.num_attention_heads, self.head_dim, True)  # (batch, seq_length, head, head_features)
         key = self._split_heads(key, self.num_attention_heads, self.head_dim, True)
         value = self._split_heads(value, self.num_attention_heads, self.head_dim, False)
 
-        seq_len = key.shape[1]
+        seq_len = F.shape(key)[1]
         offset = 0
 
-        if layer_past is not None:
-            offset = layer_past[0].shape[-2]
-            seq_len += offset
+        # if layer_past is not None:
+        #     offset = F.shape(layer_past[0])[-2]
+        #     seq_len += offset
 
-        if self.rotary_dim is not None:
-            k_rot = key[:, :, :, : self.rotary_dim]
-            k_pass = key[:, :, :, self.rotary_dim :]
+        # if self.rotary_dim is not None:
+        key_shape = F.shape(key)
+        k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+        k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+        # k_rot = key[:, :, :, : self.rotary_dim]
+        # k_pass = key[:, :, :, self.rotary_dim :]
 
-            q_rot = query[:, :, :, : self.rotary_dim]
-            q_pass = query[:, :, :, self.rotary_dim :]
+        q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+        q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+        # q_rot = query[:, :, :, : self.rotary_dim]
+        # q_pass = query[:, :, :, self.rotary_dim :]
 
-            sincos = self._fixed_pos_embedding(k_rot, 1, seq_len=seq_len)
-            k_rot = self._apply_rotary_pos_emb(k_rot, sincos, offset=offset)
-            q_rot = self._apply_rotary_pos_emb(q_rot, sincos, offset=offset)
-
-            key = self.cat1((k_rot, k_pass))
-            query = self.cat1((q_rot, q_pass))
-        else:
-            sincos = self._fixed_pos_embedding(key, 1, seq_len=seq_len)
-            key = self._apply_rotary_pos_emb(key, sincos, offset=offset)
-            query = self._apply_rotary_pos_emb(query, sincos, offset=offset)
+        k_rot = self._apply_rotary_pos_emb(k_rot, self.sins, self.coss, offset=offset)
+        q_rot = self._apply_rotary_pos_emb(q_rot, self.sins, self.coss, offset=offset)
+        
+        key = self.cat1((k_rot, k_pass))
+        query = self.cat1((q_rot, q_pass))
+        # else:
+        #     key = self._apply_rotary_pos_emb(key, self.sins, self.coss, offset=offset)
+        #     query = self._apply_rotary_pos_emb(query, self.sins, self.coss, offset=offset)
 
         key = self.transpose(key, (0, 2, 1, 3))
         query = self.transpose(query, (0, 2, 1, 3))
@@ -215,8 +226,7 @@ class GPTJAttention(nn.Cell):
             value = self.cat2((past_value, value))
 
         # compute self-attention: V x Softmax(QK^T)
-        query_length, key_length = query.shape[-2], key.shape[-2]
-        causal_mask = self.cast(attention_bias[:, :, key_length - query_length : key_length, :key_length], mindspore.bool_)
+        causal_mask = attention_bias
         attn_output = self._attn(query, key, value, causal_mask, attention_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_dim)
@@ -293,25 +303,6 @@ class GPTJPreTrainedModel(nn.Cell):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
-    # def _init_weights(self, module):
-    #     """Initialize the weights."""
-    #     if isinstance(module, (nn.Dense,)):
-    #         # Slightly different from Mesh Transformer JAX which uses truncated_normal for initialization
-    #         module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-    #         if module.bias is not None:
-    #             module.bias.data.zero_()
-    #     elif isinstance(module, nn.Embedding):
-    #         module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-    #         if module.padding_idx is not None:
-    #             module.weight.data[module.padding_idx].zero_()
-    #     elif isinstance(module, nn.LayerNorm):
-    #         module.bias.data.zero_()
-    #         module.weight.data.fill_(1.0)
-
-    # def _set_gradient_checkpointing(self, module, value=False):
-    #     if isinstance(module, GPTJModel):
-    #         module.gradient_checkpointing = value
-
 
 class GPTJModel(GPTJPreTrainedModel):
     def __init__(self, config):
@@ -335,6 +326,8 @@ class GPTJModel(GPTJPreTrainedModel):
                 1, 1, config.max_position_embeddings, config.max_position_embeddings
             ), requires_grad = False)
         print("Attention bias complete!")
+
+        self.position_ids = np.arange(config.max_position_embeddings, dtype=mindspore.int64)
 
         # Initialize weights and apply final processing
         # self.post_init()
@@ -401,7 +394,7 @@ class GPTJModel(GPTJPreTrainedModel):
             past_length = past_key_values[0][0].shape[-2]
 
         if position_ids is None:
-            position_ids = np.arange(past_length, input_shape[-1] + past_length, dtype=mindspore.int64)
+            position_ids = self.position_ids
             position_ids = self.expand_dims(position_ids, 0).view(-1, input_shape[-1])
 
         # Attention mask.
@@ -413,7 +406,7 @@ class GPTJModel(GPTJPreTrainedModel):
             # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
             # this attention mask is more simple than the triangular masking of causal attention
             # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
-            attention_mask = attention_mask[:, None, None, :]
+            attention_mask = self.expand_dims(self.expand_dims(attention_mask, 1), 1)
 
             # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
             # masked positions, this operation will create a tensor which is 0.0 for
@@ -474,33 +467,6 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
-
-    # def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-    #     token_type_ids = kwargs.get("token_type_ids", None)
-    #     # only last token for inputs_ids if past is defined in kwargs
-    #     if past:
-    #         input_ids = input_ids[:, -1].expand_dims(-1)
-    #         if token_type_ids is not None:
-    #             token_type_ids = token_type_ids[:, -1].expand_dims(-1)
-
-    #     attention_mask = kwargs.get("attention_mask", None)
-    #     position_ids = kwargs.get("position_ids", None)
-
-    #     if attention_mask is not None and position_ids is None:
-    #         # create position_ids on the fly for batch generation
-    #         position_ids = attention_mask.to(mindspore.int64).cumsum(-1) - 1
-    #         position_ids.masked_fill_(attention_mask == 0, 1)
-    #         if past:
-    #             position_ids = position_ids[:, -1].expand_dims(-1)
-    #     else:
-    #         position_ids = None
-    #     return {
-    #         "input_ids": input_ids,
-    #         "past_key_values": past,
-    #         "position_ids": position_ids,
-    #         "attention_mask": attention_mask,
-    #         "token_type_ids": token_type_ids,
-    #     }
 
     def construct(
         self,
