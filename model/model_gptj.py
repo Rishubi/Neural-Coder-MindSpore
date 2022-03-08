@@ -63,8 +63,8 @@ class GPTJAttention(nn.Cell):
         self.matmul = P.MatMul()
         self.bmatmul = P.BatchMatMul()
         self.reshape = P.Reshape()
-        self.split = P.Split(3, 2)
-        self.slice = P.StridedSlice()
+        # self.split = P.Split(3, 2)
+        # self.slice = P.StridedSlice()
 
         self.scale_attn = self.sqrt(mindspore.Tensor(self.head_dim, dtype=mindspore.float32))
 
@@ -397,7 +397,7 @@ class GPTJModel(GPTJPreTrainedModel):
             past_length = past_key_values[0][0].shape[-2]
 
         if position_ids is None:
-            position_ids = self.position_ids
+            position_ids = self.position_ids[:input_shape[-1]]
             position_ids = self.expand_dims(position_ids, 0).view(-1, input_shape[-1])
 
         # Attention mask.
