@@ -45,7 +45,7 @@ class GPTJAttention(nn.Cell):
             # raise ValueError(
             #     f"embed_dim must be divisible by num_attention_heads (got `embed_dim`: {self.embed_dim} and `num_attention_heads`: {self.num_attention_heads})."
             # )
-        self.softmax = P.Softmax()
+        self.softmax = P.Softmax(axis=-1)
         self.cat1 = P.Concat(axis=-1)
         self.cat2 = P.Concat(axis=-2)
         self.transpose = P.Transpose()
@@ -86,7 +86,7 @@ class GPTJAttention(nn.Cell):
         """
         Splits hidden dim into attn_head_size and num_attention_heads
         """
-        new_shape = F.shape(tensor)[:2] + (num_attention_heads, attn_head_size)
+        new_shape = F.shape(tensor)[:-1] + (num_attention_heads, attn_head_size)
         tensor = tensor.view(*new_shape)
         if rotary:
             return tensor
@@ -109,23 +109,23 @@ class GPTJAttention(nn.Cell):
         else:
             return None
             # raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
-        new_shape = F.shape(tensor)[:2] + (num_attention_heads * attn_head_size,)
+        new_shape = F.shape(tensor)[:-2] + (num_attention_heads * attn_head_size,)
         return tensor.view(new_shape)
 
     def _rotate_every_two(self, x):
-        x_shape = F.shape(x)
-        x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
-        x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
-        # x1 = x[:, :, :, ::2]
-        # x2 = x[:, :, :, 1::2]
+        # x_shape = F.shape(x)
+        # x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
+        # x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
+        x1 = x[:, :, :, ::2]
+        x2 = x[:, :, :, 1::2]
         x = self.stack((-x2, x1))
         x_shape = F.shape(x)
-        shape = x_shape[:3] + (x_shape[3] * x_shape[4],)
+        shape = x_shape[:-2] + (x_shape[-2] * x_shape[-1],)
         return self.reshape(x, shape)  # in einsum notation: rearrange(x, '... d j -> ... (d j)')
 
     def _apply_rotary_pos_emb(self, x, sins, coss, offset=0):
-        sin = ops.repeat_elements(self.expand_dims(self.expand_dims(sins, 1), 0), 2, 3)
-        cos = ops.repeat_elements(self.expand_dims(self.expand_dims(coss, 1), 0), 2, 3)
+        sin = ops.repeat_elements(self.expand_dims(self.expand_dims(sins[:x.shape[1]], 1), 0), 2, 3)
+        cos = ops.repeat_elements(self.expand_dims(self.expand_dims(coss[:x.shape[1]], 1), 0), 2, 3)
         return (x * cos) + (self._rotate_every_two(x) * sin)
 
     def _attn(
@@ -143,6 +143,7 @@ class GPTJAttention(nn.Cell):
         # Keep the attention weights computation in fp32 to avoid overflow issues
         query = self.cast(query, mindspore.float32)
         key = self.cast(key, mindspore.float32)
+
         attn_weights = self.bmatmul(query, key.transpose((0, 1, 3, 2)))
         inverse_mask = self.sub(
             self.cast(F.tuple_to_array((1.0,)), attn_weights.dtype),
@@ -158,7 +159,7 @@ class GPTJAttention(nn.Cell):
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = self.softmax(attn_weights, dim=-1)
+        attn_weights = self.softmax(attn_weights)
         attn_weights = self.cast(attn_weights, value.dtype)
         attn_weights = self.attn_dropout(attn_weights)
 
@@ -191,30 +192,30 @@ class GPTJAttention(nn.Cell):
         seq_len = F.shape(key)[1]
         offset = 0
 
-        # if layer_past is not None:
-        #     offset = F.shape(layer_past[0])[-2]
-        #     seq_len += offset
+        if layer_past is not None:
+            offset = F.shape(layer_past[0])[-2]
+            seq_len += offset
 
-        # if self.rotary_dim is not None:
-        key_shape = F.shape(key)
-        k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
-        k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
-        # k_rot = key[:, :, :, : self.rotary_dim]
-        # k_pass = key[:, :, :, self.rotary_dim :]
+        if self.rotary_dim is not None:
+            # key_shape = F.shape(key)
+            # k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+            # k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+            k_rot = key[:, :, :, : self.rotary_dim]
+            k_pass = key[:, :, :, self.rotary_dim :]
 
-        q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
-        q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
-        # q_rot = query[:, :, :, : self.rotary_dim]
-        # q_pass = query[:, :, :, self.rotary_dim :]
+            # q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+            # q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+            q_rot = query[:, :, :, : self.rotary_dim]
+            q_pass = query[:, :, :, self.rotary_dim :]
 
-        k_rot = self._apply_rotary_pos_emb(k_rot, self.sins, self.coss, offset=offset)
-        q_rot = self._apply_rotary_pos_emb(q_rot, self.sins, self.coss, offset=offset)
+            k_rot = self._apply_rotary_pos_emb(k_rot, self.sins, self.coss, offset=offset)
+            q_rot = self._apply_rotary_pos_emb(q_rot, self.sins, self.coss, offset=offset)
         
-        key = self.cat1((k_rot, k_pass))
-        query = self.cat1((q_rot, q_pass))
-        # else:
-        #     key = self._apply_rotary_pos_emb(key, self.sins, self.coss, offset=offset)
-        #     query = self._apply_rotary_pos_emb(query, self.sins, self.coss, offset=offset)
+            key = self.cat1((k_rot, k_pass))
+            query = self.cat1((q_rot, q_pass))
+        else:
+            key = self._apply_rotary_pos_emb(key, self.sins, self.coss, offset=offset)
+            query = self._apply_rotary_pos_emb(query, self.sins, self.coss, offset=offset)
 
         key = self.transpose(key, (0, 2, 1, 3))
         query = self.transpose(query, (0, 2, 1, 3))
@@ -226,7 +227,9 @@ class GPTJAttention(nn.Cell):
             value = self.cat2((past_value, value))
 
         # compute self-attention: V x Softmax(QK^T)
-        causal_mask = attention_bias
+        query_length, key_length = query.shape[-2], key.shape[-2]
+        # causal_mask = attention_bias
+        causal_mask = attention_bias[:, :, key_length - query_length : key_length, :key_length]
         attn_output = self._attn(query, key, value, causal_mask, attention_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_dim)
@@ -487,9 +490,6 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
         )
-        hidden_states = transformer_output
+        lm_logits = self.cast(self.lm_head(transformer_output), mindspore.float32)
 
-        lm_logits = self.cast(self.lm_head(hidden_states), mindspore.float32)
-
-        output = lm_logits
-        return output
+        return lm_logits
