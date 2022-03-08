@@ -14,15 +14,12 @@
 # limitations under the License.
 """ MindSpore GPT-J model."""
 
-from typing import Tuple, Union
-
 import mindspore
 import mindspore.numpy as np
 import math
 from mindspore import nn
 from mindspore import ops
 import mindspore.ops.operations as P
-import mindspore.ops.functional as F
 
 from .configuration_gptj import GPTJConfig
 
@@ -62,9 +59,11 @@ class GPTJAttention(nn.Cell):
         self.sub = P.Sub()
         self.matmul = P.MatMul()
         self.bmatmul = P.BatchMatMul()
+        self.bmatmul_t = P.BatchMatMul(transpose_b=True)
         self.reshape = P.Reshape()
-        # self.split = P.Split(3, 2)
-        # self.slice = P.StridedSlice()
+        self.slice = P.StridedSlice()
+        self.shape = P.Shape()
+        self.tuple_to_array = P.TupleToArray()
 
         self.scale_attn = self.sqrt(mindspore.Tensor(self.head_dim, dtype=mindspore.float32))
 
@@ -86,13 +85,13 @@ class GPTJAttention(nn.Cell):
         """
         Splits hidden dim into attn_head_size and num_attention_heads
         """
-        new_shape = F.shape(tensor)[:-1] + (num_attention_heads, attn_head_size)
+        new_shape = self.shape(tensor)[:-1] + (num_attention_heads, attn_head_size)
         tensor = tensor.view(*new_shape)
         if rotary:
             return tensor
-        if len(F.shape(tensor)) == 5:  # (batch, blocks, block_length, head, head_features)
+        if len(self.shape(tensor)) == 5:  # (batch, blocks, block_length, head, head_features)
             return self.transpose(tensor, (0, 1, 3, 2, 4))  # (batch, blocks, head, block_length, head_features)
-        elif len(F.shape(tensor)) == 4:  # (batch, seq_length, head, head_features)
+        elif len(self.shape(tensor)) == 4:  # (batch, seq_length, head, head_features)
             return self.transpose(tensor, (0, 2, 1, 3))  # (batch, head, seq_length, head_features)
         else:
             return None
@@ -102,24 +101,24 @@ class GPTJAttention(nn.Cell):
         """
         Merges attn_head_size dim and num_attn_heads dim into hidden dim
         """
-        if len(F.shape(tensor)) == 5:
+        if len(self.shape(tensor)) == 5:
             tensor = self.transpose(tensor, (0, 1, 3, 2, 4))
-        elif len(F.shape(tensor)) == 4:
+        elif len(self.shape(tensor)) == 4:
             tensor = self.transpose(tensor, (0, 2, 1, 3))
         else:
             return None
             # raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
-        new_shape = F.shape(tensor)[:-2] + (num_attention_heads * attn_head_size,)
+        new_shape = self.shape(tensor)[:-2] + (num_attention_heads * attn_head_size,)
         return tensor.view(new_shape)
 
     def _rotate_every_two(self, x):
-        # x_shape = F.shape(x)
-        # x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
-        # x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
-        x1 = x[:, :, :, ::2]
-        x2 = x[:, :, :, 1::2]
+        x_shape = self.shape(x)
+        x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
+        x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
+        # x1 = x[:, :, :, ::2]
+        # x2 = x[:, :, :, 1::2]
         x = self.stack((-x2, x1))
-        x_shape = F.shape(x)
+        x_shape = self.shape(x)
         shape = x_shape[:-2] + (x_shape[-2] * x_shape[-1],)
         return self.reshape(x, shape)  # in einsum notation: rearrange(x, '... d j -> ... (d j)')
 
@@ -144,9 +143,9 @@ class GPTJAttention(nn.Cell):
         query = self.cast(query, mindspore.float32)
         key = self.cast(key, mindspore.float32)
 
-        attn_weights = self.bmatmul(query, key.transpose((0, 1, 3, 2)))
+        attn_weights = self.bmatmul_t(query, key)
         inverse_mask = self.sub(
-            self.cast(F.tuple_to_array((1.0,)), attn_weights.dtype),
+            self.cast(self.tuple_to_array((1.0,)), attn_weights.dtype),
             self.cast(causal_mask, attn_weights.dtype)
         )
         adder = self.mul(inverse_mask, attn_weights)
@@ -189,24 +188,24 @@ class GPTJAttention(nn.Cell):
         key = self._split_heads(key, self.num_attention_heads, self.head_dim, True)
         value = self._split_heads(value, self.num_attention_heads, self.head_dim, False)
 
-        seq_len = F.shape(key)[1]
+        seq_len = self.shape(key)[1]
         offset = 0
 
         if layer_past is not None:
-            offset = F.shape(layer_past[0])[-2]
+            offset = self.shape(layer_past[0])[-2]
             seq_len += offset
 
         if self.rotary_dim is not None:
-            # key_shape = F.shape(key)
-            # k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
-            # k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
-            k_rot = key[:, :, :, : self.rotary_dim]
-            k_pass = key[:, :, :, self.rotary_dim :]
+            key_shape = self.shape(key)
+            k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+            k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+            # k_rot = key[:, :, :, : self.rotary_dim]
+            # k_pass = key[:, :, :, self.rotary_dim :]
 
-            # q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
-            # q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
-            q_rot = query[:, :, :, : self.rotary_dim]
-            q_pass = query[:, :, :, self.rotary_dim :]
+            q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+            q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+            # q_rot = query[:, :, :, : self.rotary_dim]
+            # q_pass = query[:, :, :, self.rotary_dim :]
 
             k_rot = self._apply_rotary_pos_emb(k_rot, self.sins, self.coss, offset=offset)
             q_rot = self._apply_rotary_pos_emb(q_rot, self.sins, self.coss, offset=offset)
@@ -228,7 +227,6 @@ class GPTJAttention(nn.Cell):
 
         # compute self-attention: V x Softmax(QK^T)
         query_length, key_length = query.shape[-2], key.shape[-2]
-        # causal_mask = attention_bias
         causal_mask = attention_bias[:, :, key_length - query_length : key_length, :key_length]
         attn_output = self._attn(query, key, value, causal_mask, attention_mask, head_mask)
 
@@ -269,7 +267,6 @@ class GPTJBlock(nn.Cell):
         super().__init__()
         inner_dim = 4 * config.n_embd
         self.ln_1 = nn.LayerNorm((config.n_embd,), epsilon=config.layer_norm_epsilon)
-        print("Begin constructing GPTJAttention...")
         self.attn = GPTJAttention(config)
         self.mlp = GPTJMLP(inner_dim, config)
 
@@ -313,22 +310,17 @@ class GPTJModel(GPTJPreTrainedModel):
 
         self.embed_dim = config.n_embd
         self.vocab_size = config.vocab_size
-        print("Embedding...")
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.drop = nn.Dropout(1 - config.embd_pdrop)
-        print("Begin CellList...")
         self.h = nn.CellList([GPTJBlock(config) for _ in range(config.n_layer)])
-        print("CellList complete")
         self.ln_f = nn.LayerNorm((self.embed_dim,), epsilon=config.layer_norm_epsilon)
         self.tril = nn.Tril()
         self.ones = P.Ones()
         self.expand_dims = P.ExpandDims()
         self.cast = P.Cast()
-        print("Begin attention bias...")
         self.attention_bias = mindspore.Parameter(self.tril(self.ones((config.max_position_embeddings, config.max_position_embeddings), mindspore.uint8)).view(
                 1, 1, config.max_position_embeddings, config.max_position_embeddings
             ), requires_grad = False)
-        print("Attention bias complete!")
 
         self.position_ids = np.arange(config.max_position_embeddings, dtype=mindspore.int64)
 
@@ -457,9 +449,7 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.cast = P.Cast()
-        print("Begin constructing GPTJModel...")
         self.transformer = GPTJModel(config)
-        print("GPTJModel constructed.")
         self.lm_head = nn.Dense(config.n_embd, config.vocab_size)
 
         # Initialize weights and apply final processing
