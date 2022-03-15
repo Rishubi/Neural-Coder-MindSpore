@@ -45,7 +45,6 @@ class GPTJAttention(nn.Cell):
         self.softmax = P.Softmax(axis=-1)
         self.cat1 = P.Concat(axis=-1)
         self.cat2 = P.Concat(axis=-2)
-        self.transpose = P.Transpose()
         self.cast = P.Cast()
         self.sqrt = P.Sqrt()
         self.expand_dims = P.ExpandDims()
@@ -64,6 +63,7 @@ class GPTJAttention(nn.Cell):
         self.slice = P.StridedSlice()
         self.shape = P.Shape()
         self.tuple_to_array = P.TupleToArray()
+        self.transpose = P.Transpose()
 
         self.scale_attn = self.sqrt(mindspore.Tensor(self.head_dim, dtype=mindspore.float32))
 
@@ -86,13 +86,15 @@ class GPTJAttention(nn.Cell):
         Splits hidden dim into attn_head_size and num_attention_heads
         """
         new_shape = self.shape(tensor)[:-1] + (num_attention_heads, attn_head_size)
-        tensor = tensor.view(*new_shape)
+        tensor = self.cast(tensor.view(*new_shape), mindspore.float32)
+        t_shape = tensor.shape
         if rotary:
             return tensor
         if len(self.shape(tensor)) == 5:  # (batch, blocks, block_length, head, head_features)
-            return self.transpose(tensor, (0, 1, 3, 2, 4))  # (batch, blocks, head, block_length, head_features)
+            return tensor.transpose(0, 1, 3, 2, 4)  # (batch, blocks, head, block_length, head_features)
         elif len(self.shape(tensor)) == 4:  # (batch, seq_length, head, head_features)
-            return self.transpose(tensor, (0, 2, 1, 3))  # (batch, head, seq_length, head_features)
+            return tensor.transpose(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+            # return tensor.reshape(t_shape[0], t_shape[1] * t_shape[2], t_shape[3]).transpose(0, 2, 1).reshape(t_shape[0] * t_shape[3], t_shape[1], t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[3], t_shape[1] * t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[2], t_shape[1], t_shape[3])
         else:
             return None
             # raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
@@ -101,10 +103,13 @@ class GPTJAttention(nn.Cell):
         """
         Merges attn_head_size dim and num_attn_heads dim into hidden dim
         """
+        tensor = self.cast(tensor, mindspore.float32)
+        t_shape = tensor.shape
         if len(self.shape(tensor)) == 5:
-            tensor = self.transpose(tensor, (0, 1, 3, 2, 4))
+            tensor = tensor.transpose(0, 1, 3, 2, 4)
         elif len(self.shape(tensor)) == 4:
-            tensor = self.transpose(tensor, (0, 2, 1, 3))
+            tensor = tensor.transpose(0, 2, 1, 3)
+            # tensor = tensor.reshape(t_shape[0], t_shape[1] * t_shape[2], t_shape[3]).transpose(0, 2, 1).reshape(t_shape[0] * t_shape[3], t_shape[1], t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[3], t_shape[1] * t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[2], t_shape[1], t_shape[3])
         else:
             return None
             # raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
@@ -113,18 +118,18 @@ class GPTJAttention(nn.Cell):
 
     def _rotate_every_two(self, x):
         x_shape = self.shape(x)
-        x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
-        x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
-        # x1 = x[:, :, :, ::2]
-        # x2 = x[:, :, :, 1::2]
+        # x1 = self.slice(x, (0, 0, 0, 0), x_shape, (1, 1, 1, 2))
+        # x2 = self.slice(x, (0, 0, 0, 1), x_shape, (1, 1, 1, 2))
+        x1 = x[:, :, :, ::2]
+        x2 = x[:, :, :, 1::2]
         x = self.stack((-x2, x1))
         x_shape = self.shape(x)
         shape = x_shape[:-2] + (x_shape[-2] * x_shape[-1],)
         return self.reshape(x, shape)  # in einsum notation: rearrange(x, '... d j -> ... (d j)')
 
     def _apply_rotary_pos_emb(self, x, sins, coss, offset=0):
-        sin = ops.repeat_elements(self.expand_dims(self.expand_dims(sins[:x.shape[1]], 1), 0), 2, 3)
-        cos = ops.repeat_elements(self.expand_dims(self.expand_dims(coss[:x.shape[1]], 1), 0), 2, 3)
+        sin = ops.repeat_elements(self.expand_dims(self.expand_dims(sins[offset : offset + x.shape[1]], 1), 0), 2, 3)
+        cos = ops.repeat_elements(self.expand_dims(self.expand_dims(coss[offset : offset + x.shape[1]], 1), 0), 2, 3)
         return (x * cos) + (self._rotate_every_two(x) * sin)
 
     def _attn(
@@ -148,7 +153,7 @@ class GPTJAttention(nn.Cell):
             self.cast(self.tuple_to_array((1.0,)), attn_weights.dtype),
             self.cast(causal_mask, attn_weights.dtype)
         )
-        adder = self.mul(inverse_mask, attn_weights)
+        adder = self.mul(inverse_mask, self.masked_bias)
         attn_weights = self.mul(causal_mask, attn_weights)
         attn_weights = self.add(attn_weights, adder)
 
@@ -178,6 +183,7 @@ class GPTJAttention(nn.Cell):
         attention_mask=None,
         layer_past=None,
         head_mask=None,
+        use_cache=False,
     ):
 
         query = self.q_proj(hidden_states)  # (batch, seq_length, hidden_dim)
@@ -196,34 +202,43 @@ class GPTJAttention(nn.Cell):
             seq_len += offset
 
         if self.rotary_dim is not None:
-            key_shape = self.shape(key)
-            k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
-            k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
-            # k_rot = key[:, :, :, : self.rotary_dim]
-            # k_pass = key[:, :, :, self.rotary_dim :]
+            # key_shape = self.shape(key)
+            # k_rot = self.slice(key, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+            # k_pass = self.slice(key, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+            k_rot = key[:, :, :, : self.rotary_dim]
+            k_pass = key[:, :, :, self.rotary_dim :]
 
-            q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
-            q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
-            # q_rot = query[:, :, :, : self.rotary_dim]
-            # q_pass = query[:, :, :, self.rotary_dim :]
+            # q_rot = self.slice(query, (0, 0, 0, 0), (key_shape[0], key_shape[1], key_shape[2], self.rotary_dim), (1, 1, 1, 1))
+            # q_pass = self.slice(query, (0, 0, 0, self.rotary_dim), (key_shape[0], key_shape[1], key_shape[2], key_shape[3]), (1, 1, 1, 1))
+            q_rot = query[:, :, :, : self.rotary_dim]
+            q_pass = query[:, :, :, self.rotary_dim :]
 
-            k_rot = self._apply_rotary_pos_emb(k_rot, self.sins, self.coss, offset=offset)
-            q_rot = self._apply_rotary_pos_emb(q_rot, self.sins, self.coss, offset=offset)
+            k_rot = self._apply_rotary_pos_emb(k_rot, self.sins[:seq_len], self.coss[:seq_len], offset=offset)
+            q_rot = self._apply_rotary_pos_emb(q_rot, self.sins[:seq_len], self.coss[:seq_len], offset=offset)
         
             key = self.cat1((k_rot, k_pass))
             query = self.cat1((q_rot, q_pass))
         else:
-            key = self._apply_rotary_pos_emb(key, self.sins, self.coss, offset=offset)
-            query = self._apply_rotary_pos_emb(query, self.sins, self.coss, offset=offset)
+            key = self._apply_rotary_pos_emb(key, self.sins[:seq_len], self.coss[:seq_len], offset=offset)
+            query = self._apply_rotary_pos_emb(query, self.sins[:seq_len], self.coss[:seq_len], offset=offset)
 
-        key = self.transpose(key, (0, 2, 1, 3))
-        query = self.transpose(query, (0, 2, 1, 3))
+        key = self.cast(key, mindspore.float32).transpose(0, 2, 1, 3)
+        query = self.cast(query, mindspore.float32).transpose(0, 2, 1, 3)
+        # t_shape = key.shape
+        # key = self.cast(key, mindspore.float32).reshape(t_shape[0], t_shape[1] * t_shape[2], t_shape[3]).transpose(0, 2, 1).reshape(t_shape[0] * t_shape[3], t_shape[1], t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[3], t_shape[1] * t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[2], t_shape[1], t_shape[3])
+        # t_shape = query.shape
+        # query = self.cast(query, mindspore.float32).reshape(t_shape[0], t_shape[1] * t_shape[2], t_shape[3]).transpose(0, 2, 1).reshape(t_shape[0] * t_shape[3], t_shape[1], t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[3], t_shape[1] * t_shape[2]).transpose(0, 2, 1).reshape(t_shape[0], t_shape[2], t_shape[1], t_shape[3])
 
         if layer_past is not None:
             past_key = layer_past[0]
             past_value = layer_past[1]
             key = self.cat2((past_key, key))
             value = self.cat2((past_value, value))
+
+        if use_cache:
+            present = (key, value)
+        else:
+            present = None
 
         # compute self-attention: V x Softmax(QK^T)
         query_length, key_length = query.shape[-2], key.shape[-2]
@@ -234,7 +249,7 @@ class GPTJAttention(nn.Cell):
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        return attn_output
+        return (attn_output, present)
 
 
 class GPTJMLP(nn.Cell):
@@ -277,21 +292,30 @@ class GPTJBlock(nn.Cell):
         layer_past=None,
         attention_mask=None,
         head_mask=None,
+        use_cache=False,
     ):
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
-        attn_output = self.attn(
+        attn_outputs = self.attn(
             hidden_states,
             attention_bias,
             layer_past=layer_past,
             attention_mask=attention_mask,
             head_mask=head_mask,
+            use_cache=use_cache,
         )
+        attn_output = attn_outputs[0]
+        outputs = attn_outputs[1:]
 
         feed_forward_hidden_states = self.mlp(hidden_states)
         hidden_states = attn_output + feed_forward_hidden_states + residual
 
-        return hidden_states
+        if use_cache:
+            outputs = (hidden_states,) + outputs
+        else:
+            outputs = (hidden_states,) + outputs[1:]
+
+        return outputs
 
 
 class GPTJPreTrainedModel(nn.Cell):
@@ -307,7 +331,7 @@ class GPTJPreTrainedModel(nn.Cell):
 class GPTJModel(GPTJPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-
+        self.config = config
         self.embed_dim = config.n_embd
         self.vocab_size = config.vocab_size
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
@@ -322,7 +346,8 @@ class GPTJModel(GPTJPreTrainedModel):
                 1, 1, config.max_position_embeddings, config.max_position_embeddings
             ), requires_grad = False)
 
-        self.position_ids = np.arange(config.max_position_embeddings, dtype=mindspore.int64)
+        self.position_ids = np.arange(config.max_position_embeddings, dtype=mindspore.int32)
+        self.use_cache = config.use_cache
 
         # Initialize weights and apply final processing
         # self.post_init()
@@ -352,6 +377,34 @@ class GPTJModel(GPTJPreTrainedModel):
         head_mask = self.cast(head_mask, self.dtype)  # switch to float if need + fp16 compatibility
         return head_mask
 
+    # def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
+    #     token_type_ids = kwargs.get("token_type_ids", None)
+    #     # only last token for inputs_ids if past is defined in kwargs
+    #     if past:
+    #         input_ids = input_ids[:, -1].unsqueeze(-1)
+    #         if token_type_ids is not None:
+    #             token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
+
+    #     attention_mask = kwargs.get("attention_mask", None)
+    #     position_ids = kwargs.get("position_ids", None)
+
+    #     if attention_mask is not None and position_ids is None:
+    #         # create position_ids on the fly for batch generation
+    #         position_ids = attention_mask.long().cumsum(-1) - 1
+    #         position_ids.masked_fill_(attention_mask == 0, 1)
+    #         if past:
+    #             position_ids = position_ids[:, -1].unsqueeze(-1)
+    #     else:
+    #         position_ids = None
+    #     return {
+    #         "input_ids": input_ids,
+    #         "past_key_values": past,
+    #         "use_cache": kwargs.get("use_cache"),
+    #         "position_ids": position_ids,
+    #         "attention_mask": attention_mask,
+    #         "token_type_ids": token_type_ids,
+    #     }
+
     def construct(
         self,
         input_ids=None,
@@ -361,10 +414,11 @@ class GPTJModel(GPTJPreTrainedModel):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
+        use_cache=None,
     ):
+        use_cache = use_cache if use_cache is not None else self.use_cache
         if input_ids is not None and inputs_embeds is not None:
             return None
-            # raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             input_shape = input_ids.shape
             input_ids = input_ids.view(-1, input_shape[-1])
@@ -374,7 +428,6 @@ class GPTJModel(GPTJPreTrainedModel):
             batch_size = inputs_embeds.shape[0]
         else:
             return None
-            # raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
@@ -389,7 +442,7 @@ class GPTJModel(GPTJPreTrainedModel):
             past_length = past_key_values[0][0].shape[-2]
 
         if position_ids is None:
-            position_ids = self.position_ids[:input_shape[-1]]
+            position_ids = self.position_ids[past_length : input_shape[-1] + past_length]
             position_ids = self.expand_dims(position_ids, 0).view(-1, input_shape[-1])
 
         # Attention mask.
@@ -430,19 +483,25 @@ class GPTJModel(GPTJPreTrainedModel):
 
         output_shape = input_shape + (hidden_states.shape[-1],)
 
+        presents = () if use_cache else None
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-            hidden_states = block(
+            outputs = block(
                 hidden_states,
                 attention_bias=self.attention_bias,
                 layer_past=layer_past,
                 attention_mask=attention_mask,
                 head_mask=head_mask[i],
+                use_cache=use_cache,
             )
+            hidden_states = outputs[0]
+
+            if use_cache:
+                presents = presents + (outputs[1],)
 
         hidden_states = self.ln_f(hidden_states)
         hidden_states = hidden_states.view(*output_shape)
 
-        return hidden_states
+        return hidden_states, presents
 
 
 class GPTJForCausalLM(GPTJPreTrainedModel):
@@ -470,8 +529,9 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
         position_ids=None,
         head_mask=None,
         inputs_embeds=None,
+        use_cache=None,
     ):
-        transformer_output = self.transformer(
+        transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -479,7 +539,10 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
         )
-        lm_logits = self.cast(self.lm_head(transformer_output), mindspore.float32)
+        hidden_states = transformer_outputs[0]
 
-        return lm_logits
+        lm_logits = self.cast(self.lm_head(hidden_states), mindspore.float32)
+
+        return lm_logits, transformer_outputs[1]

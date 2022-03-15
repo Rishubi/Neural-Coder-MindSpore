@@ -5,7 +5,7 @@ from mindspore import context
 
 if __name__ == "__main__":
     print("loading model")
-    model_ms = GPTJForCausalLM(GPTJConfig())
+    model_ms = GPTJForCausalLM(GPTJConfig(n_layer=2))
     print("model loaded")
     ids = np.arange(2011).astype(mindspore.int32)
     print("begin inference")
